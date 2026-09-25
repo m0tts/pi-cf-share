@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import cfShare, {
   accessChallengesAnonymousVisitor, deploymentUrl, parseAccounts, parseSource,
-  savedAccountId, sourceCompletions, stageAssets, stageWorker, unlockWorker,
+  savedAccountId, sourceCompletions, stageAssets, stageWorker, unlockWorker, workerDashboardUrl,
 } from "../src/cf-share.ts";
 
 const ID_A = "41502faeef990142381b28952e25b6ea";
@@ -99,6 +99,7 @@ test("account parsing and anonymous challenge are conservative", async () => fix
   await assert.rejects(savedAccountId(), /invalid account ID/);
   assert.equal(deploymentUrl("Preview https://1-test.foo.workers.dev Live https://test.foo.workers.dev", "test"), "https://test.foo.workers.dev");
   assert.equal(deploymentUrl("https://wrong.foo.workers.dev", "test"), undefined);
+  assert.equal(workerDashboardUrl(ID_A, "pi-share-test"), `https://dash.cloudflare.com/${ID_A}/workers/services/view/pi-share-test/production`);
   assert.equal(await accessChallengesAnonymousVisitor("https://test.foo.workers.dev", async () => Response.redirect("https://team.cloudflareaccess.com/cdn-cgi/access/login", 302)), true);
   assert.equal(await accessChallengesAnonymousVisitor("https://test.foo.workers.dev", async () => new Response("public")), false);
 })));
@@ -163,12 +164,13 @@ test("protected flow deploys harmless placeholder, verifies Access, then uploads
       approve = true;
       await handler(`path ${md}`, ctx);
       assert.match(messages.at(-1), /Published behind Access/);
+      assert.match(messages.at(-1), new RegExp(`Dashboard: https://dash\\.cloudflare\\.com/${ID_A}/workers/services/view/pi-share-[a-f0-9]+/production`));
       let output = await readFile(log, "utf8");
       assert.match(output, /placeholder[\s\S]*real-content/);
       assert.match(output, /"SHARE_LOCKED": "true"[\s\S]*"SHARE_LOCKED": "false"/);
       assert.equal((output.match(/deploy --config/g) ?? []).length, 2);
       assert.equal(await savedAccountId(), ID_A);
-      assert.ok(confirms.some(text => /All traffic/.test(text)));
+      assert.ok(confirms.some(text => /All traffic/.test(text) && /workers\/services\/view\/pi-share-/.test(text)));
       challenge = false;
       await handler(`path ${md}`, ctx);
       assert.match(messages.at(-1), /Removed newly created Worker/);
@@ -177,6 +179,7 @@ test("protected flow deploys harmless placeholder, verifies Access, then uploads
       visibility = "public";
       await handler(`path ${md}`, ctx);
       assert.match(messages.at(-1), /Published publicly/);
+      assert.match(messages.at(-1), /Dashboard: https:\/\/dash\.cloudflare\.com\/41502faeef990142381b28952e25b6ea\/workers\/services\/view\/pi-share-[a-f0-9]+\/production/);
       assert.ok(confirms.some(text => /anyone on the internet/.test(text)));
       assert.equal(statuses.at(-1), undefined);
     });

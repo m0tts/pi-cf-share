@@ -115,6 +115,10 @@ export function sourceCompletions(
 	}
 }
 
+export function workerDashboardUrl(accountId: string, name: string): string {
+	return `https://dash.cloudflare.com/${accountId}/workers/services/view/${encodeURIComponent(name)}/production`;
+}
+
 export function deploymentUrl(output: string, name: string): string | undefined {
 	// Wrangler's route output identifies the live Worker; reject unrelated preview/dashboard URLs.
 	const urls = output.match(/https:\/\/[a-z0-9.-]+\.workers\.dev(?:\/[a-z0-9/_-]*)?/gi) ?? [];
@@ -474,7 +478,7 @@ export default function cfShare(pi: ExtensionAPI): void {
 					progress("waiting for Access setup");
 					const ready = await ctx.ui.confirm(
 						"Enable Cloudflare Access before uploading content",
-						`The locked Worker is at ${url}. In https://dash.cloudflare.com/${accountId}/workers-and-pages select ${name} > Access > Protect this Worker behind Access > All traffic. Configure who may sign in (account members or invitees by email), then Apply Access. Zero Trust must be enabled on the account; see ${ACCESS_GUIDE}. This prompt does NOT configure Access for you. Continue only after the policy is active. Cancel deletes the placeholder.`,
+						`The locked Worker is at ${url}. Open ${workerDashboardUrl(accountId, name)} > Access > Protect this Worker behind Access > All traffic. Configure who may sign in (account members or invitees by email), then Apply Access. Zero Trust must be enabled on the account; see ${ACCESS_GUIDE}. This prompt does NOT configure Access for you. Continue only after the policy is active. Cancel deletes the placeholder.`,
 					);
 					if (!ready) throw new Error("Access setup cancelled");
 					progress("checking anonymous Access challenge", true);
@@ -487,7 +491,7 @@ export default function cfShare(pi: ExtensionAPI): void {
 					if (!(await accessChallengesAnonymousVisitor(url))) throw new Error("Access challenge disappeared after content deployment");
 				}
 				attemptedWorker = undefined;
-				report(ctx, `${protectedShare ? "Published behind Access" : "Published publicly"}: ${url}\nWorker: ${name} · Account: ${account.name}${protectedShare ? "\nVerify the permitted identities and keep Access enabled. An anonymous challenge does not validate the policy." : ""}`);
+				report(ctx, `${protectedShare ? "Published behind Access" : "Published publicly"}: ${url}\nWorker: ${name} · Account: ${account.name}\nDashboard: ${workerDashboardUrl(accountId, name)}${protectedShare ? "\nVerify the permitted identities and keep Access enabled. An anonymous challenge does not validate the policy." : ""}`);
 			} catch (error) {
 				const reason = error instanceof Error ? error.message : String(error);
 				let cleanup = "";
@@ -502,7 +506,7 @@ export default function cfShare(pi: ExtensionAPI): void {
 						);
 						cleanup = `\nRemoved newly created Worker ${attemptedWorker}.`;
 					} catch {
-						cleanup = `\nURGENT: Check/delete Worker ${attemptedWorker}: https://dash.cloudflare.com/${accountId}/workers-and-pages`;
+						cleanup = `\nURGENT: Check/delete Worker ${attemptedWorker}: ${workerDashboardUrl(accountId!, attemptedWorker)}`;
 					}
 				}
 				report(ctx, `Worker publish failed: ${reason}${cleanup}`, "error");
