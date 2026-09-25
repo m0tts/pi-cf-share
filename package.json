@@ -1,0 +1,21 @@
+{
+  "name": "cf-share",
+  "version": "0.1.0",
+  "description": "Share reviewed Pi sessions, HTML and Markdown through Cloudflare Workers",
+  "repository": { "type": "git", "url": "git+https://github.com/m0tts/pi-cf-share.git" },
+  "type": "module",
+  "keywords": ["pi-package", "cloudflare", "workers", "sharing"],
+  "license": "MIT",
+  "files": ["src", "README.md", "LICENSE"],
+  "pi": { "extensions": ["./src/cf-share.ts"] },
+  "scripts": {
+    "test": "node --experimental-strip-types --test test/*.test.mjs",
+    "check": "tsc --noEmit"
+  },
+  "peerDependencies": { "@earendil-works/pi-coding-agent": "*" },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.87.0",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
+}
