@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import cfShare, {
   accessChallengesAnonymousVisitor, deploymentUrl, parseAccounts, parseSource,
-  parseProfile, savedAccountId, sourceCompletions, stageAssets, stageWorker, unlockWorker, workerDashboardUrl,
+  parseDeviceAuthorization, parseProfile, savedAccountId, sourceCompletions, stageAssets, stageWorker, unlockWorker, workerDashboardUrl,
 } from "../src/cf-share.ts";
 
 const ID_A = "41502faeef990142381b28952e25b6ea";
@@ -102,6 +102,10 @@ test("account parsing and anonymous challenge are conservative", async () => fix
   assert.equal(parseProfile(JSON.stringify([{ name: "team", boundDirectories: [root] }, { name: "nested", boundDirectories: [join(root, "project")] }]), join(root, "project", "src")), "nested");
   assert.equal(parseProfile(JSON.stringify([{ name: "team", boundDirectories: [root] }]), `${root}-other`), undefined);
   assert.throws(() => parseProfile('{"name":"bad"}', root), /invalid profile list/);
+  assert.deepEqual(parseDeviceAuthorization('To authorize cf, please visit:\n  https://dash.cloudflare.com/oauth2/device\n\nand enter the code:\n  ABCD-EFGH'), { url: "https://dash.cloudflare.com/oauth2/device", code: "ABCD-EFGH" });
+  assert.equal(parseDeviceAuthorization('please visit: https://dash.cloudflare.com.evil.test/oauth2/device and enter the code: ABCD-EFGH'), undefined);
+  assert.equal(parseDeviceAuthorization('please visit: https://dash.cloudflare.com@evil.test/oauth2/device and enter the code: ABCD-EFGH'), undefined);
+  assert.equal(parseDeviceAuthorization('please visit: http://dash.cloudflare.com/oauth2/device and enter the code: ABCD-EFGH'), undefined);
   assert.equal(await savedAccountId(), undefined);
   await writeFile(join(root, "cf-share.json"), '{"accountId":"wrong"}');
   await assert.rejects(savedAccountId(), /invalid account ID/);
@@ -133,7 +137,7 @@ test("session export uses only the active Pi session, before any deployment", as
   const messages = [];
   const ctx = { cwd: root, mode: "tui", hasUI: true, sessionManager: { getSessionFile: () => session },
     ui: { notify: message => messages.push(message), setStatus() {}, select: async (_title, choices) => choices[0], confirm: async () => false } };
-  await withEnv({ PATH: `${bin}:${process.env.PATH}`, PUBLISH_TEST_LOG: log, PI_CODING_AGENT_DIR: join(root, "config") }, async () => {
+  await withEnv({ PATH: `${bin}:${process.env.PATH}`, PUBLISH_TEST_LOG: log, CF_SHARE_CF_BIN: join(bin, "cf"), PI_CODING_AGENT_DIR: join(root, "config") }, async () => {
     await handler("session", ctx);
     assert.match(messages.at(-1), /cancelled/);
   });
@@ -166,7 +170,7 @@ test("protected flow deploys harmless placeholder, verifies Access, then uploads
   globalThis.fetch = async () => challenge && (!failAfterUpload || ++probes % 2 === 1)
     ? Response.redirect("https://team.cloudflareaccess.com/cdn-cgi/access/login", 302) : new Response("public");
   try {
-    await withEnv({ PATH: `${bin}:${process.env.PATH}`, PUBLISH_TEST_LOG: log, PI_CODING_AGENT_DIR: configRoot, CLOUDFLARE_ACCOUNT_ID: ID_B }, async () => {
+    await withEnv({ PATH: `${bin}:${process.env.PATH}`, PUBLISH_TEST_LOG: log, CF_SHARE_CF_BIN: join(bin, "cf"), PI_CODING_AGENT_DIR: configRoot, CLOUDFLARE_ACCOUNT_ID: ID_B }, async () => {
       approve = false;
       await handler(`path ${md}`, ctx);
       assert.match(messages.at(-1), /cancelled/);
@@ -207,4 +211,134 @@ test("protected flow deploys harmless placeholder, verifies Access, then uploads
       assert.equal(statuses.at(-1), undefined);
     });
   } finally { globalThis.fetch = originalFetch; }
+}));
+
+test("account flow signs in within Pi, ignores an invalid API token, and remembers OAuth", async () => fixture(async root => {
+  const bin = join(root, "cf"), log = join(root, "commands.log"), ready = join(root, "signed-in");
+  await writeFile(join(root, ".env"), "CLOUDFLARE_API_TOKEN=from-project-file\n");
+  await writeFile(bin, `#!/bin/sh
+if [ -f .env ]; then echo 'project-dotenv-loaded' >> "$PUBLISH_TEST_LOG"; fi
+printf '%s|%s|%s\\n' "\${CLOUDFLARE_API_TOKEN:+token}" "$CLOUDFLARE_ACCOUNT_ID" "$*" >> "$PUBLISH_TEST_LOG"
+if [ "$1 $2" = 'auth list' ]; then echo '[]'; fi
+if [ "$1 $2" = 'auth whoami' ]; then
+  if [ -n "$CLOUDFLARE_API_TOKEN" ]; then echo '{"authenticated":true,"tokenValid":false,"accounts":[]}';
+  elif [ -f "$AUTH_READY" ]; then echo '{"authenticated":true,"tokenValid":true,"accounts":[{"id":"${ID_A}","name":"team"}]}';
+  else echo '{"authenticated":false}'; fi
+fi
+if [ "$1 $2" = 'auth login' ]; then
+  printf 'To authorize cf, please visit:\\n  https://dash.cloudflare.com/oauth2/device\\n\\nand enter the code:\\n  ABCD-EFGH\\n' >&2
+  echo 'access_token=never-expose-this' >&2
+  touch "$AUTH_READY"
+fi
+`);
+  await chmod(bin, 0o755);
+  let handler; cfShare({ on() {}, registerCommand: (_name, command) => { handler = command.handler; } });
+  const messages = [], dialogs = [];
+  const ctx = { cwd: root, mode: "tui", hasUI: true, sessionManager: { getSessionFile: () => undefined },
+    ui: { notify: text => messages.push(text), setStatus() {}, select: async (_title, choices) => choices[0],
+      confirm: async (title, text) => { dialogs.push({ title, text }); return !title.startsWith("Deploy locked Worker"); } } };
+  await withEnv({ CF_SHARE_CF_BIN: bin, PI_CODING_AGENT_DIR: join(root, "config"), PUBLISH_TEST_LOG: log, AUTH_READY: ready,
+    CLOUDFLARE_API_TOKEN: "bad-token", CLOUDFLARE_ACCOUNT_ID: ID_B }, async () => {
+    await handler("account", ctx);
+    assert.match(messages.at(-1), /Selected \/cf-share account: team/);
+    assert.ok(dialogs.some(({ text }) => /Open https:\/\/dash.cloudflare.com\/oauth2\/device/.test(text) && /ABCD-EFGH/.test(text)));
+    assert.doesNotMatch(JSON.stringify({ dialogs, messages }), /never-expose-this|bad-token/);
+    assert.deepEqual(JSON.parse(await readFile(join(root, "config/cf-share.json"), "utf8")), { accountId: ID_A, authMode: "oauth" });
+    await handler("account", ctx);
+    assert.equal(await savedAccountId(), ID_A);
+    const doc = join(root, "doc.md"); await writeFile(doc, "# Local test");
+    await handler(`path ${doc}`, ctx);
+    assert.match(messages.at(-1), /Publishing cancelled; nothing uploaded/);
+  });
+  const commands = await readFile(log, "utf8");
+  assert.match(commands, /token\|\|auth whoami/);
+  assert.match(commands, /\|\|auth login --force --no-browser/);
+  assert.match(commands, /\|\|auth whoami/);
+  assert.equal((commands.match(/^\|\|auth whoami/gm) ?? []).length, 3);
+  assert.doesNotMatch(commands, /project-dotenv-loaded|\|deploy /);
+  assert.doesNotMatch(commands, new RegExp(`${ID_B}\\|auth login`));
+}));
+
+test("account flow can authenticate a bound profile, and cancellation does not sign in", async () => fixture(async root => {
+  const bin = join(root, "cf"), log = join(root, "commands.log"), ready = join(root, "signed-in");
+  await writeFile(bin, `#!/bin/sh
+printf '%s\\n' "$*" >> "$PUBLISH_TEST_LOG"
+if [ "$1 $2" = 'auth list' ]; then echo '[{"name":"team","boundDirectories":["${root}"]}]'; fi
+if [ "$1 $2" = 'auth whoami' ]; then
+  if [ -f "$AUTH_READY" ]; then echo '{"authenticated":true,"tokenValid":true,"accounts":[{"id":"${ID_A}","name":"team"}]}';
+  else echo '{"authenticated":false}'; fi
+fi
+if [ "$1 $2" = 'auth create' ]; then
+  echo 'To authorize cf, please visit: https://dash.cloudflare.com/oauth2/device and enter the code: ABCD-EFGH' >&2
+  touch "$AUTH_READY"
+fi
+`);
+  await chmod(bin, 0o755);
+  let handler; cfShare({ on() {}, registerCommand: (_name, command) => { handler = command.handler; } });
+  let allow = false; const messages = [];
+  const ctx = { cwd: root, mode: "tui", hasUI: true, sessionManager: { getSessionFile: () => undefined },
+    ui: { notify: text => messages.push(text), setStatus() {}, select: async (_title, choices) => choices[0], confirm: async () => allow } };
+  await withEnv({ CF_SHARE_CF_BIN: bin, PI_CODING_AGENT_DIR: join(root, "config"), PUBLISH_TEST_LOG: log, AUTH_READY: ready, CLOUDFLARE_API_TOKEN: "" }, async () => {
+    await handler("account", ctx);
+    assert.doesNotMatch(await readFile(log, "utf8"), /auth create/);
+    allow = true;
+    await handler("account", ctx);
+    assert.match(messages.at(-1), /Selected \/cf-share account/);
+    assert.equal(await savedAccountId(), ID_A);
+  });
+  assert.match(await readFile(log, "utf8"), /auth create team --no-browser[\s\S]*auth whoami --profile team/);
+}));
+
+test("account picker offers an in-Pi identity switch even when already authenticated", async () => fixture(async root => {
+  const bin = join(root, "cf"), log = join(root, "commands.log"), switched = join(root, "switched");
+  await writeFile(bin, `#!/bin/sh
+printf '%s\\n' "$*" >> "$PUBLISH_TEST_LOG"
+if [ "$1 $2" = 'auth list' ]; then echo '[]'; fi
+if [ "$1 $2" = 'auth whoami' ]; then
+  if [ -f "$AUTH_READY" ]; then echo '{"authenticated":true,"tokenValid":true,"accounts":[{"id":"${ID_B}","name":"other"}]}';
+  else echo '{"authenticated":true,"tokenValid":true,"accounts":[{"id":"${ID_A}","name":"original"}]}'; fi
+fi
+if [ "$1 $2" = 'auth login' ]; then
+  echo 'To authorize cf, please visit: https://dash.cloudflare.com/oauth2/device and enter the code: ABCD-EFGH' >&2
+  touch "$AUTH_READY"
+fi
+`);
+  await chmod(bin, 0o755);
+  let handler; cfShare({ on() {}, registerCommand: (_name, command) => { handler = command.handler; } });
+  let selected = 0; const messages = [];
+  const ctx = { cwd: root, mode: "tui", hasUI: true, sessionManager: { getSessionFile: () => undefined },
+    ui: { notify: text => messages.push(text), setStatus() {}, confirm: async () => true,
+      select: async (_title, choices) => ++selected === 1 ? choices.at(-1) : choices[0] } };
+  await withEnv({ CF_SHARE_CF_BIN: bin, PI_CODING_AGENT_DIR: join(root, "config"), PUBLISH_TEST_LOG: log, AUTH_READY: switched, CLOUDFLARE_API_TOKEN: "" }, async () => {
+    await handler("account", ctx);
+    assert.match(messages.at(-1), new RegExp(`other \\(${ID_B}\\)`));
+    assert.equal(await savedAccountId(), ID_B);
+  });
+  assert.match(await readFile(log, "utf8"), /auth login --force --no-browser/);
+}));
+
+test("account picker can switch back to a configured API token", async () => fixture(async root => {
+  const bin = join(root, "cf"), log = join(root, "commands.log"), config = join(root, "config");
+  await mkdir(config);
+  await writeFile(join(config, "cf-share.json"), JSON.stringify({ accountId: ID_A, authMode: "oauth" }));
+  await writeFile(bin, `#!/bin/sh
+printf '%s|%s\\n' "\${CLOUDFLARE_API_TOKEN:+token}" "$*" >> "$PUBLISH_TEST_LOG"
+if [ "$1 $2" = 'auth list' ]; then echo '[]'; fi
+if [ "$1 $2" = 'auth whoami' ]; then
+  if [ -n "$CLOUDFLARE_API_TOKEN" ]; then echo '{"authenticated":true,"tokenValid":true,"accounts":[{"id":"${ID_B}","name":"token"}]}';
+  else echo '{"authenticated":true,"tokenValid":true,"accounts":[{"id":"${ID_A}","name":"oauth"}]}'; fi
+fi
+`);
+  await chmod(bin, 0o755);
+  let handler; cfShare({ on() {}, registerCommand: (_name, command) => { handler = command.handler; } });
+  let chosen = 0; const messages = [];
+  const ctx = { cwd: root, mode: "tui", hasUI: true, sessionManager: { getSessionFile: () => undefined },
+    ui: { notify: text => messages.push(text), setStatus() {}, confirm: async () => true,
+      select: async (_title, choices) => ++chosen === 1 ? choices.at(-1) : choices[0] } };
+  await withEnv({ CF_SHARE_CF_BIN: bin, PI_CODING_AGENT_DIR: config, PUBLISH_TEST_LOG: log, CLOUDFLARE_API_TOKEN: "configured-token" }, async () => {
+    await handler("account", ctx);
+    assert.match(messages.at(-1), new RegExp(`token \\(${ID_B}\\)`));
+    assert.deepEqual(JSON.parse(await readFile(join(config, "cf-share.json"), "utf8")), { accountId: ID_B });
+  });
+  assert.match(await readFile(log, "utf8"), /\|auth whoami[\s\S]*token\|auth whoami/);
 }));

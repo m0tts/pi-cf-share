@@ -19,6 +19,7 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-c
 
 // An anonymous login challenge tests only this URL, not the policy's authorized identities.
 const WORKER_TEMPLATE = fileURLToPath(new URL("./worker/worker.mjs", import.meta.url));
+const CF_CLI_SCRIPT = fileURLToPath(new URL("../node_modules/cf/bin/cf", import.meta.url));
 const ACCESS_GUIDE = "https://developers.cloudflare.com/workers/configuration/cloudflare-access/";
 
 export async function stageWorker(
@@ -64,6 +65,7 @@ const MAX_FILE_BYTES = 25 * 1024 * 1024;
 const MAX_TOTAL_BYTES = 100 * 1024 * 1024;
 const MAX_FILES = 20_000;
 const COMMAND_TIMEOUT_MS = 180_000;
+const LOGIN_TIMEOUT_MS = 330_000;
 const STATUS_KEY = "cf-share";
 const ACCOUNT_ID_RE = /^[a-f0-9]{32}$/i;
 
@@ -211,6 +213,13 @@ export async function stageAssets(source: Source, output: string): Promise<Inven
 }
 
 type CommandResult = { stdout: string; stderr: string };
+
+function startCommand(command: string, args: string[], cwd: string, env: NodeJS.ProcessEnv) {
+	const executable = command === "cf" ? env.CF_SHARE_CF_BIN || process.execPath : command;
+	const argv = command === "cf" && !env.CF_SHARE_CF_BIN ? [CF_CLI_SCRIPT, ...args] : args;
+	return spawn(executable, argv, { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
+}
+
 export async function runCommand(
 	command: string,
 	args: string[],
@@ -219,7 +228,7 @@ export async function runCommand(
 	timeout = COMMAND_TIMEOUT_MS,
 ): Promise<CommandResult> {
 	return await new Promise((ok, fail) => {
-		const child = spawn(command, args, { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
+		const child = startCommand(command, args, cwd, env);
 		let stdout = "";
 		let stderr = "";
 		const collect = (part: string, chunk: Buffer) => (part + chunk.toString()).slice(-64_000);
@@ -234,7 +243,7 @@ export async function runCommand(
 			clearTimeout(timer);
 			fail((error as NodeJS.ErrnoException).code === "ENOENT"
 				? new Error(command === "cf"
-					? "The cf CLI is not installed. Install it with npm install -g cf, then run cf auth login."
+					? "The bundled cf CLI is unavailable. Reinstall the cf-share Pi package and its dependencies."
 					: "The pi CLI is not on PATH; it is required to export the current session.")
 				: error);
 		});
@@ -300,7 +309,7 @@ function accountPath(): string {
 	return join(agentDir(), "cf-share.json");
 }
 
-export async function savedAccountId(): Promise<string | undefined> {
+async function savedSelection(): Promise<{ accountId: string; authMode?: "oauth" } | undefined> {
 	let raw: string;
 	try {
 		raw = await readFile(accountPath(), "utf8");
@@ -314,26 +323,89 @@ export async function savedAccountId(): Promise<string | undefined> {
 		typeof document !== "object" ||
 		!("accountId" in document) ||
 		typeof document.accountId !== "string" ||
-		!ACCOUNT_ID_RE.test(document.accountId)
+		!ACCOUNT_ID_RE.test(document.accountId) ||
+		("authMode" in document && document.authMode !== "oauth")
 	) {
 		throw new Error(`${accountPath()} has an invalid account ID; fix or remove the file`);
 	}
-	return document.accountId;
+	return { accountId: document.accountId, ...("authMode" in document && document.authMode === "oauth" && { authMode: "oauth" as const }) };
 }
 
-async function saveAccountId(id: string): Promise<void> {
+export async function savedAccountId(): Promise<string | undefined> {
+	return (await savedSelection())?.accountId;
+}
+
+async function saveAccountId(id: string, useOAuth: boolean): Promise<void> {
 	if (!ACCOUNT_ID_RE.test(id)) throw new Error("Invalid account ID");
 	await mkdir(agentDir(), { recursive: true });
 	const path = accountPath();
 	const temporary = `${path}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
 	try {
-		await writeFile(temporary, JSON.stringify({ accountId: id }) + "\n", {
+		await writeFile(temporary, JSON.stringify({ accountId: id, ...(useOAuth && { authMode: "oauth" }) }) + "\n", {
 			mode: 0o600,
 			flag: "wx",
 		});
 		await rename(temporary, path);
 	} finally {
 		await rm(temporary, { force: true });
+	}
+}
+
+export function parseDeviceAuthorization(output: string): { url: string; code: string } | undefined {
+	const text = output.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
+	const match = text.match(/please visit:\s*(https:\/\/[^\s]+)\s*and enter the code:\s*([a-z0-9-]{4,32})/i);
+	if (!match) return undefined;
+	const url = new URL(match[1]);
+	if (url.protocol !== "https:" || !["dash.cloudflare.com", "dash.staging.cloudflare.com"].includes(url.hostname) ||
+		url.port || url.username || url.password) return undefined;
+	return { url: url.toString(), code: match[2] };
+}
+
+async function loginWithCf(ctx: ExtensionCommandContext, cwd: string, profile?: string): Promise<boolean> {
+	const env = { ...process.env };
+	delete env.CLOUDFLARE_ACCOUNT_ID;
+	delete env.CLOUDFLARE_API_TOKEN;
+	const args = profile ? ["auth", "create", profile, "--no-browser"] : ["auth", "login", "--force", "--no-browser"];
+	const child = startCommand("cf", args, cwd, env);
+	let recent = "";
+	let timedOut = false;
+	let resolveInstructions: (value: { url: string; code: string }) => void = () => {};
+	const instructions = new Promise<{ url: string; code: string }>((resolve) => { resolveInstructions = resolve; });
+	const collect = (chunk: Buffer) => {
+		recent = (recent + chunk.toString()).slice(-8_192);
+		const info = parseDeviceAuthorization(recent);
+		if (info) resolveInstructions(info);
+	};
+	child.stdout.on("data", collect);
+	child.stderr.on("data", collect);
+	const completed = new Promise<void>((resolve, reject) => {
+		child.on("error", () => reject(new Error("Could not start the bundled cf CLI")));
+		child.on("close", (code) => code === 0 ? resolve() : reject(new Error(timedOut
+			? "Cloudflare sign-in timed out; try /cf-share account again"
+			: "Cloudflare sign-in failed or was denied; try /cf-share account again")));
+	});
+	// A login can poll for up to five minutes. Never pass raw CLI output to Pi's transcript.
+	void completed.catch(() => {});
+	const timer = setTimeout(() => { timedOut = true; child.kill("SIGTERM"); }, LOGIN_TIMEOUT_MS);
+	try {
+		const info = await Promise.race([instructions, completed.then(() => {
+			throw new Error("cf finished without providing a device authorization code");
+		})]);
+		const continueLogin = await ctx.ui.confirm(
+			"Sign in to Cloudflare",
+			`Open ${info.url} in your browser and enter code ${info.code}.\n\nOnly approve a login that you initiated here. Choose Continue to wait for authorization, or Cancel to stop. The code expires in at most five minutes.`,
+		);
+		if (!continueLogin) {
+			child.kill("SIGTERM");
+			await completed.catch(() => {});
+			return false;
+		}
+		ctx.ui.notify("Waiting for Cloudflare authorization…", "info");
+		await completed;
+		return true;
+	} finally {
+		clearTimeout(timer);
+		if (child.exitCode === null) child.kill("SIGTERM");
 	}
 }
 
@@ -359,31 +431,90 @@ export async function chooseAccount(
 	ctx: ExtensionCommandContext,
 	cwd: string,
 	force = false,
-): Promise<{ account: Account; profile?: string } | undefined> {
+): Promise<{ account: Account; profile?: string; useOAuth: boolean } | undefined> {
+	// cf loads local .env files even for auth commands. Keep project tokens/config out of OAuth.
+	const authCwd = await mkdtemp(join(tmpdir(), "pi-cf-share-auth-"));
+	try {
+		return await selectAccountFromCf(ctx, cwd, authCwd, force);
+	} finally {
+		await rm(authCwd, { recursive: true, force: true });
+	}
+}
+
+async function selectAccountFromCf(
+	ctx: ExtensionCommandContext,
+	cwd: string,
+	authCwd: string,
+	force: boolean,
+): Promise<{ account: Account; profile?: string; useOAuth: boolean } | undefined> {
 	// Keep the directory-bound OAuth profile when deploying from isolated staging.
-	const profileList = await runCommand("cf", ["auth", "list"], cwd, process.env, 30_000);
+	const profileList = await runCommand("cf", ["auth", "list"], authCwd, process.env, 30_000);
 	const profile = parseProfile(profileList.stdout, cwd);
-	// Identity lookup is deliberately unpinned, so all accounts are available for selection.
-	const identityEnv = { ...process.env };
-	delete identityEnv["CLOUDFLARE_ACCOUNT_ID"];
-	const identity = await runCommand("cf", ["auth", "whoami", ...(profile ? ["--profile", profile] : [])], cwd, identityEnv, 30_000);
-	const accounts = parseAccounts(identity.stdout);
-	const saved = force ? undefined : await savedAccountId();
-	if (saved) {
-		const current = accounts.find((account) => account.id === saved);
+	const saved = force ? await savedSelection().catch(() => undefined) : await savedSelection();
+	let useOAuth = saved?.authMode === "oauth" || !process.env.CLOUDFLARE_API_TOKEN;
+	const identityEnv = () => {
+		const env = { ...process.env };
+		delete env.CLOUDFLARE_ACCOUNT_ID;
+		if (useOAuth) delete env.CLOUDFLARE_API_TOKEN;
+		return env;
+	};
+	const fetchAccounts = async (): Promise<Account[] | undefined> => {
+		const identity = await runCommand("cf", ["auth", "whoami", ...(profile ? ["--profile", profile] : [])], authCwd, identityEnv(), 30_000);
+		const value: unknown = JSON.parse(identity.stdout);
+		if (value && typeof value === "object" &&
+			(("authenticated" in value && value.authenticated === false) ||
+			("tokenValid" in value && value.tokenValid === false))) return undefined;
+		return parseAccounts(identity.stdout);
+	};
+	let accounts = await fetchAccounts();
+	if (!accounts && useOAuth && process.env.CLOUDFLARE_API_TOKEN &&
+		await ctx.ui.confirm("Try your configured API token?", "OAuth could not be verified. Use CLOUDFLARE_API_TOKEN for cf-share instead?")) {
+		useOAuth = false;
+		accounts = await fetchAccounts();
+	}
+	if (!accounts) {
+		const agreed = await ctx.ui.confirm(
+			"Sign in to Cloudflare?",
+			`cf could not verify your current credentials. Sign in with Cloudflare OAuth using a short-lived browser code?${process.env.CLOUDFLARE_API_TOKEN ? " Your API token will be ignored for cf-share after you sign in." : ""}`,
+		);
+		if (!agreed) return undefined;
+		if (!(await loginWithCf(ctx, authCwd, profile))) return undefined;
+		useOAuth = true;
+		accounts = await fetchAccounts();
+		if (!accounts) throw new Error("Cloudflare sign-in completed, but cf could not verify the new credentials");
+	}
+	if (!force && saved) {
+		const current = accounts.find((account) => account.id === saved.accountId);
 		if (!current)
 			throw new Error(
-				`Selected account ${saved} is not available to cf with the current credentials; run /cf-share account to choose another`,
+				`Selected account ${saved.accountId} is not available to cf with the current credentials; run /cf-share account to choose another`,
 			);
-		return { account: current, profile };
+		return { account: current, profile, useOAuth };
 	}
-	const choices = accounts.map((account) => `${account.name} (${account.id})`);
-	const choice = await ctx.ui.select("Choose the Cloudflare account for /cf-share", choices);
+	const signInChoice = "Sign in with another Cloudflare identity (OAuth)";
+	const tokenChoice = "Use configured API token instead";
+	let choices = accounts.map((account) => `${account.name} (${account.id})`);
+	let choice = await ctx.ui.select("Choose the Cloudflare account for /cf-share", [
+		...choices, signInChoice, ...(useOAuth && process.env.CLOUDFLARE_API_TOKEN ? [tokenChoice] : []),
+	]);
+	if (!choice) return undefined;
+	if (choice === signInChoice || choice === tokenChoice) {
+		if (choice === signInChoice) {
+			if (!(await loginWithCf(ctx, authCwd, profile))) return undefined;
+			useOAuth = true;
+		} else {
+			useOAuth = false;
+		}
+		accounts = await fetchAccounts();
+		if (!accounts) throw new Error("cf could not verify the selected credentials; check your Cloudflare permissions");
+		choices = accounts.map((account) => `${account.name} (${account.id})`);
+		choice = await ctx.ui.select("Choose the Cloudflare account for /cf-share", choices);
+	}
 	if (!choice) return undefined;
 	const account = accounts[choices.indexOf(choice)];
 	if (!account) throw new Error("Unknown account selection");
-	await saveAccountId(account.id);
-	return { account, profile };
+	await saveAccountId(account.id, useOAuth);
+	return { account, profile, useOAuth };
 }
 
 export default function cfShare(pi: ExtensionAPI): void {
@@ -421,6 +552,7 @@ export default function cfShare(pi: ExtensionAPI): void {
 			let attemptedWorker: string | undefined;
 			let accountId: string | undefined;
 			let profile: string | undefined;
+			let useOAuth = false;
 			let phase = "preparing";
 			const started = Date.now();
 			const progress = (message: string, announce = false) => {
@@ -444,8 +576,10 @@ export default function cfShare(pi: ExtensionAPI): void {
 				}
 				const { account } = selection;
 				profile = selection.profile;
+				useOAuth = selection.useOAuth;
 				accountId = account.id;
-				const env = { ...process.env, CLOUDFLARE_ACCOUNT_ID: accountId };
+				const env: NodeJS.ProcessEnv = { ...process.env, CLOUDFLARE_ACCOUNT_ID: accountId };
+				if (useOAuth) delete env.CLOUDFLARE_API_TOKEN;
 				const profileArgs = profile ? ["--profile", profile] : [];
 				// Keep real content outside the deployable assets directory until Access is verified.
 				const contentDir = join(staging, "content");
@@ -527,11 +661,13 @@ export default function cfShare(pi: ExtensionAPI): void {
 				if (attemptedWorker && staging) {
 					progress("removing failed deployment", true);
 					try {
+						const cleanupEnv: NodeJS.ProcessEnv = { ...process.env, CLOUDFLARE_ACCOUNT_ID: accountId };
+						if (useOAuth) delete cleanupEnv.CLOUDFLARE_API_TOKEN;
 						await runCommand(
 							"cf",
 							["workers", "delete", attemptedWorker, "--force", ...(profile ? ["--profile", profile] : [])],
 							staging,
-							{ ...process.env, CLOUDFLARE_ACCOUNT_ID: accountId },
+							cleanupEnv,
 						);
 						cleanup = `\nRemoved newly created Worker ${attemptedWorker}.`;
 					} catch {
