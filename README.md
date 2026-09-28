@@ -12,9 +12,9 @@ Install from GitHub:
 pi install git:github.com/m0tts/pi-cf-share
 ```
 
-For local development: `pi -e ./` (or `pi --extension ./src/cf-share.ts`). Disable any other extension that registers `/cf-share` to avoid duplicate commands. Use Node.js 22+ and `npm install && npm test && npm run check` to test. There is no account or network requirement for tests.
+For local development: run `pi --no-extensions -e ./` from this checkout to load only this version, rather than your separately installed `/cf-share` package (other extensions are disabled for that Pi invocation). Use Node.js 22+ and `npm install && npm test && npm run check` to test. There is no account or network requirement for tests.
 
-For publishing, you need a [Cloudflare account](https://dash.cloudflare.com/sign-up) that you are authorized to use, [Wrangler](https://developers.cloudflare.com/workers/wrangler/install-and-update/) on `PATH`, and a login (`wrangler login`). If your account does not yet have Zero Trust, follow [Zero Trust setup](https://developers.cloudflare.com/cloudflare-one/setup/) before choosing protected sharing. To enable Access you need Workers and Access administration permissions. For a session export, the `pi` CLI must also be on `PATH` and the current session must be saved.
+For publishing, you need a [Cloudflare account](https://dash.cloudflare.com/sign-up) that you are authorized to use. The [Cloudflare `cf` CLI](https://github.com/cloudflare/cf) (currently beta) is installed with this Pi package; no separate CLI install or terminal login is needed. Run `/cf-share account` inside Pi: if needed, it shows a Cloudflare verification URL and code, waits for you to approve the login in your browser, then lets you select an account. It reuses and refreshes `cf` OAuth credentials, including a named profile previously bound to the project. You can also use a `CLOUDFLARE_API_TOKEN`; if you choose OAuth instead, cf-share ignores that token for its own commands without changing your environment. If your account does not yet have Zero Trust, follow [Zero Trust setup](https://developers.cloudflare.com/cloudflare-one/setup/) before choosing protected sharing. To enable Access you need Workers and Access administration permissions. For a session export, the `pi` CLI must also be on `PATH` and the current session must be saved.
 
 ```text
 /cf-share                    # ask the model to suggest what is safe and useful to share; no deploy
@@ -22,18 +22,18 @@ For publishing, you need a [Cloudflare account](https://dash.cloudflare.com/sign
 /cf-share path ./report.md   # publish formatted Markdown
 /cf-share path ./page.html   # publish HTML
 /cf-share path ./dist        # publish a static directory with index.html or index.md
-/cf-share account            # choose another Cloudflare account
+/cf-share account            # sign in if needed, or change identity/account
 ```
 
 A direct file or directory path without the `path` keyword also works. **There is no option to provide a different session file.** If you want to share a portion of the session, create and review an HTML/Markdown artifact first. The bare command asks the agent for a suggestion, rather than staging or deploying anything automatically.
 
 ## Publishing flow
 
-1. Choose an account returned by `wrangler whoami --json`. Only its account ID is saved in `<PI_CODING_AGENT_DIR or ~/.pi/agent>/cf-share.json`; an unavailable saved account causes an error rather than silently switching accounts.
+1. `/cf-share account` verifies your current credentials, offers a browser-based device login if needed, and shows available accounts. It also lets you switch Cloudflare identities. Only the selected account ID and (if chosen) an OAuth preference are saved in `<PI_CODING_AGENT_DIR or ~/.pi/agent>/cf-share.json`; an unavailable saved account causes an error rather than silently switching accounts. The selected ID is pinned in both the temporary Build Output and `CLOUDFLARE_ACCOUNT_ID` for `cf deploy --prebuilt` and cleanup; credentials are managed by `cf`, not saved by this package.
 2. Review the staged files and content, then choose **Access (recommended)** or **Public**. Static files are copied without symlinks, hidden files, source maps, or executable asset routes. Limits: 25 MiB per file, 100 MiB total, 20,000 files. The session export includes tool output and may include credentials; inspect it closely.
 3. **Access:** The extension first deploys a locked placeholder **without the selected content**. In the dashboard, select this Worker > **Access** > **Protect this Worker behind Access** > **All traffic**. Configure which account members or email addresses may sign in, apply the policy, then continue in Pi. The extension checks that an anonymous visitor receives an Access login challenge *before* uploading content, and checks again afterward. A failed challenge triggers a best-effort deletion of the new Worker. See [Cloudflare's Worker Access guide](https://developers.cloudflare.com/workers/configuration/cloudflare-access/).
 4. **Public:** Requires an additional explicit confirmation. Content is deployed directly without Access; anyone on the internet can read it. Do not use this for sessions or files containing sensitive information. If account-level Access already protects all Workers, a public share might still require an explicit Worker-level bypass in the dashboard; this extension does not change policies.
 
 An anonymous challenge does **not** prove which people the policy allows. Check the policy and test with an authorized and an unauthorized identity. If Access is later disabled, the published assets may become public. The Worker has no independent Access JWT validation because the Workers Static Assets router does not forward `ctx.access` to the Worker. Do not use this ad-hoc sharing flow as a substitute for a production deployment with defense-in-depth authentication. If deletion fails, follow the dashboard link in the error immediately.
 
-Worker preview URLs are disabled. The extension does not configure custom domains, create Access policies, or publish to Cloudflare Pages. No credentials or session content are saved in the package; deployment staging is removed after the command completes.
+Worker preview URLs are disabled. The extension does not configure custom domains, create Access policies, or publish to Cloudflare Pages. It stages a prebuilt Worker and static assets in `cf`'s `.cloudflare/output/v0` format, not a Wrangler config. No credentials or session content are saved in the package; deployment staging is removed after the command completes.

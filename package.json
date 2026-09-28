@@ -13,6 +13,7 @@
     "check": "tsc --noEmit"
   },
   "peerDependencies": { "@earendil-works/pi-coding-agent": "*" },
+  "dependencies": { "cf": "1.0.0-beta.5" },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.87.0",
     "@types/node": "^24.0.0",
