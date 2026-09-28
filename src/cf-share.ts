@@ -13,7 +13,7 @@ import {
 	writeFile,
 } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 
@@ -28,33 +28,35 @@ export async function stageWorker(
 	locked = false,
 	markdownIndex = false,
 ): Promise<string> {
-	const config = join(staging, "wrangler.jsonc");
-	await copyFile(WORKER_TEMPLATE, join(staging, "worker.mjs"), constants.COPYFILE_EXCL);
-	await writeFile(
-		config,
-		JSON.stringify(
-			{
-				name,
-				main: "./worker.mjs",
-				account_id: accountId,
-				compatibility_date: "2025-10-01",
-				workers_dev: true,
-				preview_urls: false,
-				vars: { SHARE_LOCKED: locked ? "true" : "false", SHARE_INDEX_MD: markdownIndex ? "true" : "false" },
-				assets: { directory: "./public", binding: "ASSETS", run_worker_first: true },
-			},
-			null,
-			2,
-		) + "\n",
-		{ flag: "wx" },
-	);
+	const output = join(staging, ".cloudflare", "output", "v0");
+	const worker = join(output, "workers", "default");
+	const config = join(worker, "worker.config.json");
+	await mkdir(join(worker, "bundle"), { recursive: true });
+	await copyFile(WORKER_TEMPLATE, join(worker, "bundle", "worker.mjs"), constants.COPYFILE_EXCL);
+	await writeFile(join(output, "config.json"), JSON.stringify({
+		accountId,
+		buildContext: { isPreview: false },
+	}, null, 2) + "\n", { flag: "wx" });
+	await writeFile(config, JSON.stringify({
+		name,
+		compatibilityDate: "2025-10-01",
+		workersDev: true,
+		previewUrls: false,
+		env: {
+			SHARE_LOCKED: { type: "text", value: locked ? "true" : "false" },
+			SHARE_INDEX_MD: { type: "text", value: markdownIndex ? "true" : "false" },
+			ASSETS: { type: "assets" },
+		},
+		assets: { runWorkerFirst: true },
+		manifest: { type: "complete", mainModule: "worker.mjs", modules: { "worker.mjs": { type: "esm" } } },
+	}, null, 2) + "\n", { flag: "wx" });
 	return config;
 }
 
 export async function unlockWorker(config: string, markdownIndex: boolean): Promise<void> {
 	const settings = JSON.parse(await readFile(config, "utf8"));
-	settings.vars.SHARE_LOCKED = "false";
-	settings.vars.SHARE_INDEX_MD = markdownIndex ? "true" : "false";
+	settings.env.SHARE_LOCKED.value = "false";
+	settings.env.SHARE_INDEX_MD.value = markdownIndex ? "true" : "false";
 	await writeFile(config, JSON.stringify(settings, null, 2) + "\n");
 }
 
@@ -120,7 +122,7 @@ export function workerDashboardUrl(accountId: string, name: string): string {
 }
 
 export function deploymentUrl(output: string, name: string): string | undefined {
-	// Wrangler's route output identifies the live Worker; reject unrelated preview/dashboard URLs.
+	// cf's deploy output identifies the live Worker; reject unrelated preview/dashboard URLs.
 	const urls = output.match(/https:\/\/[a-z0-9.-]+\.workers\.dev(?:\/[a-z0-9/_-]*)?/gi) ?? [];
 	return urls.find((url) => new URL(url).hostname.startsWith(`${name}.`))?.replace(/\/+$/, "");
 }
@@ -231,8 +233,8 @@ export async function runCommand(
 		child.on("error", (error) => {
 			clearTimeout(timer);
 			fail((error as NodeJS.ErrnoException).code === "ENOENT"
-				? new Error(command === "wrangler"
-					? "Wrangler is not installed. Install it with npm install -g wrangler, then run wrangler login."
+				? new Error(command === "cf"
+					? "The cf CLI is not installed. Install it with npm install -g cf, then run cf auth login."
 					: "The pi CLI is not on PATH; it is required to export the current session.")
 				: error);
 		});
@@ -242,7 +244,7 @@ export async function runCommand(
 			else
 				fail(
 					new Error(
-						`${command} ${args[0]} failed (${signal ?? code}); check Wrangler authentication/permissions (wrangler login) or the input session. Command output was not logged because it may contain sensitive data.`,
+						`${command} ${args[0]} failed (${signal ?? code}); ${command === "cf" ? "check cf authentication/permissions (cf auth login)" : "check the input session"}. Command output was not logged because it may contain sensitive data.`,
 					),
 				);
 		});
@@ -259,16 +261,17 @@ function report(
 
 export type Account = { id: string; name: string };
 
-/** Never use Wrangler's implicit default account. Reject malformed identity data. */
+/** Never use cf's implicit default account. Reject malformed identity data. */
 export function parseAccounts(output: string): Account[] {
 	const value: unknown = JSON.parse(output);
 	if (
 		!value ||
 		typeof value !== "object" ||
-		!("accounts" in value) ||
-		!Array.isArray(value.accounts)
+		!("authenticated" in value) || value.authenticated !== true ||
+		!("tokenValid" in value) || value.tokenValid !== true ||
+		!("accounts" in value) || !Array.isArray(value.accounts)
 	) {
-		throw new Error("Wrangler did not return an account list. Create a Cloudflare account at https://dash.cloudflare.com/sign-up if needed, then run wrangler login");
+		throw new Error("cf did not return a verified account list. Run cf auth login or check your token permissions");
 	}
 	const accounts: Account[] = [];
 	for (const account of value.accounts) {
@@ -279,13 +282,13 @@ export function parseAccounts(output: string): Account[] {
 			!ACCOUNT_ID_RE.test(account.id) ||
 			typeof account.name !== "string"
 		) {
-			throw new Error("Wrangler returned an invalid account list");
+			throw new Error("cf returned an invalid account list");
 		}
 		if (accounts.some((item) => item.id === account.id))
-			throw new Error("Wrangler returned duplicate account IDs");
+			throw new Error("cf returned duplicate account IDs");
 		accounts.push({ id: account.id, name: account.name });
 	}
-	if (accounts.length === 0) throw new Error("No Cloudflare accounts available. Sign up at https://dash.cloudflare.com/sign-up if needed, then run wrangler login");
+	if (accounts.length === 0) throw new Error("No Cloudflare accounts available to cf. Sign up at https://dash.cloudflare.com/sign-up if needed, or check your token permissions");
 	return accounts;
 }
 
@@ -334,24 +337,45 @@ async function saveAccountId(id: string): Promise<void> {
 	}
 }
 
+export function parseProfile(output: string, cwd: string): string | undefined {
+	const profiles: unknown = JSON.parse(output);
+	if (!Array.isArray(profiles) || !profiles.every((profile) =>
+		profile && typeof profile === "object" &&
+		typeof profile.name === "string" && profile.name.length > 0 && Array.isArray(profile.boundDirectories) &&
+		profile.boundDirectories.every((dir: unknown) => typeof dir === "string" && isAbsolute(dir))
+	)) throw new Error("cf returned an invalid profile list");
+	let selected: { name: string; length: number } | undefined;
+	for (const profile of profiles) {
+		for (const dir of profile.boundDirectories) {
+			const path = relative(dir, cwd);
+			if (!isAbsolute(path) && path !== ".." && !path.startsWith(`..${sep}`) &&
+				(!selected || dir.length > selected.length)) selected = { name: profile.name, length: dir.length };
+		}
+	}
+	return selected?.name;
+}
+
 export async function chooseAccount(
 	ctx: ExtensionCommandContext,
 	cwd: string,
 	force = false,
-): Promise<Account | undefined> {
+): Promise<{ account: Account; profile?: string } | undefined> {
+	// Keep the directory-bound OAuth profile when deploying from isolated staging.
+	const profileList = await runCommand("cf", ["auth", "list"], cwd, process.env, 30_000);
+	const profile = parseProfile(profileList.stdout, cwd);
 	// Identity lookup is deliberately unpinned, so all accounts are available for selection.
 	const identityEnv = { ...process.env };
 	delete identityEnv["CLOUDFLARE_ACCOUNT_ID"];
-	const identity = await runCommand("wrangler", ["whoami", "--json"], cwd, identityEnv, 30_000);
+	const identity = await runCommand("cf", ["auth", "whoami", ...(profile ? ["--profile", profile] : [])], cwd, identityEnv, 30_000);
 	const accounts = parseAccounts(identity.stdout);
 	const saved = force ? undefined : await savedAccountId();
 	if (saved) {
 		const current = accounts.find((account) => account.id === saved);
 		if (!current)
 			throw new Error(
-				`Selected account ${saved} is not available to Wrangler; run /cf-share account to choose another`,
+				`Selected account ${saved} is not available to cf with the current credentials; run /cf-share account to choose another`,
 			);
-		return current;
+		return { account: current, profile };
 	}
 	const choices = accounts.map((account) => `${account.name} (${account.id})`);
 	const choice = await ctx.ui.select("Choose the Cloudflare account for /cf-share", choices);
@@ -359,7 +383,7 @@ export async function chooseAccount(
 	const account = accounts[choices.indexOf(choice)];
 	if (!account) throw new Error("Unknown account selection");
 	await saveAccountId(account.id);
-	return account;
+	return { account, profile };
 }
 
 export default function cfShare(pi: ExtensionAPI): void {
@@ -381,8 +405,8 @@ export default function cfShare(pi: ExtensionAPI): void {
 			}
 			if (args.trim() === "account") {
 				try {
-					const account = await chooseAccount(ctx, ctx.cwd, true);
-					if (account) report(ctx, `Selected /cf-share account: ${account.name} (${account.id})`);
+					const selection = await chooseAccount(ctx, ctx.cwd, true);
+					if (selection) report(ctx, `Selected /cf-share account: ${selection.account.name} (${selection.account.id})`);
 				} catch (error) {
 					report(
 						ctx,
@@ -396,6 +420,7 @@ export default function cfShare(pi: ExtensionAPI): void {
 			let staging: string | undefined;
 			let attemptedWorker: string | undefined;
 			let accountId: string | undefined;
+			let profile: string | undefined;
 			let phase = "preparing";
 			const started = Date.now();
 			const progress = (message: string, announce = false) => {
@@ -411,17 +436,20 @@ export default function cfShare(pi: ExtensionAPI): void {
 			try {
 				const source = parseSource(args, ctx.cwd, ctx.sessionManager.getSessionFile());
 				staging = await mkdtemp(join(tmpdir(), "pi-cf-share-"));
-				progress("checking Wrangler account", true);
-				const account = await chooseAccount(ctx, staging);
-				if (!account) {
+				progress("checking cf account", true);
+				const selection = await chooseAccount(ctx, ctx.cwd);
+				if (!selection) {
 					report(ctx, "Publishing cancelled; no account selected.");
 					return;
 				}
+				const { account } = selection;
+				profile = selection.profile;
 				accountId = account.id;
 				const env = { ...process.env, CLOUDFLARE_ACCOUNT_ID: accountId };
+				const profileArgs = profile ? ["--profile", profile] : [];
 				// Keep real content outside the deployable assets directory until Access is verified.
 				const contentDir = join(staging, "content");
-				const publicDir = join(staging, "public");
+				const publicDir = join(staging, ".cloudflare", "output", "v0", "workers", "default", "assets");
 				let inventory: Inventory;
 				if (source.kind === "session") {
 					progress("exporting session", true);
@@ -448,6 +476,7 @@ export default function cfShare(pi: ExtensionAPI): void {
 				const markdownIndex = !!(await lstat(join(contentDir, "index.md")).catch(() => undefined))?.isFile()
 					&& !(await lstat(join(contentDir, "index.html")).catch(() => undefined))?.isFile();
 				// A protected share initially deploys a locked placeholder without user content.
+				await mkdir(join(staging, ".cloudflare", "output", "v0", "workers", "default"), { recursive: true });
 				if (protectedShare) {
 					await mkdir(publicDir);
 					await writeFile(join(publicDir, "index.html"), "Share awaiting Cloudflare Access setup");
@@ -471,9 +500,9 @@ export default function cfShare(pi: ExtensionAPI): void {
 
 				attemptedWorker = name;
 				progress(protectedShare ? "deploying locked placeholder" : "deploying public content", true);
-				const deployed = await runCommand("wrangler", ["deploy", "--config", config], staging, env);
+				const deployed = await runCommand("cf", ["deploy", "--prebuilt", ...profileArgs], staging, env);
 				const url = deploymentUrl(`${deployed.stdout}\n${deployed.stderr}`, name);
-				if (!url) throw new Error("Wrangler did not return a workers.dev URL; check the account subdomain");
+				if (!url) throw new Error("cf did not return a workers.dev URL; check the account subdomain");
 				if (protectedShare) {
 					progress("waiting for Access setup");
 					const ready = await ctx.ui.confirm(
@@ -487,7 +516,7 @@ export default function cfShare(pi: ExtensionAPI): void {
 					await rename(contentDir, publicDir);
 					await unlockWorker(config, markdownIndex);
 					progress("uploading protected content", true);
-					await runCommand("wrangler", ["deploy", "--config", config], staging, env);
+					await runCommand("cf", ["deploy", "--prebuilt", ...profileArgs], staging, env);
 					if (!(await accessChallengesAnonymousVisitor(url))) throw new Error("Access challenge disappeared after content deployment");
 				}
 				attemptedWorker = undefined;
@@ -499,8 +528,8 @@ export default function cfShare(pi: ExtensionAPI): void {
 					progress("removing failed deployment", true);
 					try {
 						await runCommand(
-							"wrangler",
-							["delete", attemptedWorker, "--force", "--config", join(staging, "wrangler.jsonc")],
+							"cf",
+							["workers", "delete", attemptedWorker, "--force", ...(profile ? ["--profile", profile] : [])],
 							staging,
 							{ ...process.env, CLOUDFLARE_ACCOUNT_ID: accountId },
 						);
